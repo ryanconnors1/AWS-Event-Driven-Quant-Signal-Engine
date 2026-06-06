@@ -9,6 +9,12 @@ data "archive_file" "ingestion_zip" {
   output_path = "../build/ingestion.zip"
 }
 
+data "archive_file" "processing_zip" {
+  type        = "zip"
+  source_dir  = "../lambdas/processing"
+  output_path = "../build/processing.zip"
+}
+
 
 resource "aws_s3_bucket" "market_data" {
   bucket = "market-data-${random_id.suffix.hex}"
@@ -16,6 +22,19 @@ resource "aws_s3_bucket" "market_data" {
 
 resource "random_id" "suffix" {
   byte_length = 4
+}
+
+resource "aws_s3_bucket_notification" "bucket_notification" {
+  bucket = aws_s3_bucket.market_data.id
+
+  queue {
+    queue_arn = aws_sqs_queue.processing_queue.arn
+    events    = ["s3:ObjectCreated:*"]
+
+    filter_prefix = "raw/"
+  }
+
+  depends_on = [aws_sqs_queue_policy.processing_queue_policy]
 }
 
 
@@ -43,6 +62,27 @@ resource "aws_sqs_queue" "processing_queue" {
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.processing_dlq.arn
     maxReceiveCount     = 3
+  })
+}
+
+resource "aws_sqs_queue_policy" "processing_queue_policy" {
+  queue_url = aws_sqs_queue.processing_queue.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = "*"
+        Action = "sqs:SendMessage"
+        Resource = aws_sqs_queue.processing_queue.arn
+        Condition = {
+          ArnEquals = {
+            "aws:SourceArn" = aws_s3_bucket.market_data.arn
+          }
+        }
+      }
+    ]
   })
 }
 
@@ -101,13 +141,6 @@ resource "aws_iam_policy" "ingestion_policy" {
         Action = ["s3:PutObject"],
         Resource = [
             "${aws_s3_bucket.market_data.arn}/*"
-            ]
-      },
-      {
-        Effect = "Allow",
-        Action = ["sqs:SendMessage"],
-        Resource = [
-            aws_sqs_queue.processing_queue.arn
             ]
       }
     ]

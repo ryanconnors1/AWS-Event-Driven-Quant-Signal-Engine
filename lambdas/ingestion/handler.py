@@ -9,8 +9,6 @@ secrets = boto3.client("secretsmanager")
 
 
 def ingestion_handler(event, context):
-    print("Received event:", event)
-
     # 1. Parse SQS message
     body = json.loads(event["Records"][0]["body"])
     ticker = body["ticker"]
@@ -45,8 +43,6 @@ def ingestion_handler(event, context):
         Key=key,
         Body=json.dumps(data)
     )
-
-    print(f"Wrote data to s3://{bucket}/{key}")
 
     return {
         "statusCode": 200,
