@@ -99,12 +99,16 @@ resource "aws_iam_policy" "ingestion_policy" {
       {
         Effect = "Allow",
         Action = ["s3:PutObject"],
-        Resource = "*"
+        Resource = [
+            "${aws_s3_bucket.market_data.arn}/*"
+            ]
       },
       {
         Effect = "Allow",
         Action = ["sqs:SendMessage"],
-        Resource = "*"
+        Resource = [
+            aws_sqs_queue.processing_queue.arn
+            ]
       }
     ]
   })
@@ -124,6 +128,12 @@ resource "aws_lambda_function" "ingestion" {
   filename = data.archive_file.ingestion_zip.output_path
 
   source_code_hash = data.archive_file.ingestion_zip.output_base64sha256
+
+  environment {
+    variables = {
+        BUCKET_NAME = aws_s3_bucket.market_data.bucket
+    }
+  }
 
   timeout = 30
 }
