@@ -46,9 +46,9 @@ resource "aws_s3_bucket" "market_data" {
 
 resource "aws_s3_object" "ticker_universe" {
   bucket = aws_s3_bucket.market_data.id
-  key    = "config/sp500_tickers.txt"
-  source = "${path.module}/../config/sp500_tickers.txt"
-  etag   = filemd5("${path.module}/../config/sp500_tickers.txt")
+  key    = "config/alpharank_universe.txt"
+  source = "${path.module}/../config/alpharank_universe.txt"
+  etag   = filemd5("${path.module}/../config/alpharank_universe.txt")
 }
 
 resource "random_id" "suffix" {
@@ -471,4 +471,237 @@ resource "aws_lambda_permission" "ranking_eventbridge" {
   function_name = aws_lambda_function.ranking.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.ranking_schedule.arn
+}
+
+# ---------------------------------------------------------------------------
+# AlphaRank read API (API Gateway HTTP API + Lambda over DynamoDB)
+# ---------------------------------------------------------------------------
+
+variable "budget_alert_email" {
+  description = "Email for the cost budget alert. Leave empty to skip alert notifications."
+  type        = string
+  default     = "ryannumber3@gmail.com"
+}
+
+data "archive_file" "api_zip" {
+  type        = "zip"
+  source_dir  = "../lambdas/api"
+  output_path = "../build/api.zip"
+}
+
+resource "aws_iam_policy" "api_policy" {
+  name = "alpharank-api-policy"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = [
+          aws_dynamodb_table.trading_signals.arn,
+          "${aws_dynamodb_table.trading_signals.arn}/index/BatchRankIndex",
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "api_attach" {
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = aws_iam_policy.api_policy.arn
+}
+
+resource "aws_lambda_function" "api" {
+  function_name = "alpharank-api-lambda"
+  role          = aws_iam_role.lambda_role.arn
+  runtime       = "python3.11"
+  handler       = "handler.api_handler"
+
+  filename         = data.archive_file.api_zip.output_path
+  source_code_hash = data.archive_file.api_zip.output_base64sha256
+
+  timeout = 30
+
+  environment {
+    variables = {
+      SIGNALS_TABLE    = aws_dynamodb_table.trading_signals.name
+      BATCH_RANK_INDEX = "BatchRankIndex"
+    }
+  }
+}
+
+resource "aws_apigatewayv2_api" "http" {
+  name          = "alpharank-api"
+  protocol_type = "HTTP"
+
+  cors_configuration {
+    allow_origins = ["*"]
+    allow_methods = ["GET", "OPTIONS"]
+    allow_headers = ["*"]
+    max_age       = 3600
+  }
+}
+
+resource "aws_apigatewayv2_integration" "api" {
+  api_id                 = aws_apigatewayv2_api.http.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.api.invoke_arn
+  payload_format_version = "2.0"
+}
+
+locals {
+  api_routes = [
+    "GET /api/batches",
+    "GET /api/universe",
+    "GET /api/universe/latest",
+    "GET /api/tickers/{ticker}",
+  ]
+}
+
+resource "aws_apigatewayv2_route" "routes" {
+  for_each  = toset(local.api_routes)
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = each.value
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.http.id
+  name        = "$default"
+  auto_deploy = true
+}
+
+resource "aws_lambda_permission" "api_gateway" {
+  statement_id  = "AllowExecutionFromApiGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/*"
+}
+
+# ---------------------------------------------------------------------------
+# AlphaRank static site hosting (S3 + CloudFront, always-free tier)
+# ---------------------------------------------------------------------------
+
+resource "aws_s3_bucket" "dashboard" {
+  bucket = "alpharank-dashboard-${random_id.suffix.hex}"
+}
+
+resource "aws_s3_bucket_public_access_block" "dashboard" {
+  bucket                  = aws_s3_bucket.dashboard.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_cloudfront_origin_access_control" "dashboard" {
+  name                              = "alpharank-dashboard-oac"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "dashboard" {
+  enabled             = true
+  default_root_object = "index.html"
+  price_class         = "PriceClass_100"
+  comment             = "AlphaRank dashboard"
+
+  origin {
+    domain_name              = aws_s3_bucket.dashboard.bucket_regional_domain_name
+    origin_id                = "s3-dashboard"
+    origin_access_control_id = aws_cloudfront_origin_access_control.dashboard.id
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "s3-dashboard"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    # Managed CachingOptimized policy
+    cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
+  }
+
+  # SPA fallback: serve index.html for client-side routes / missing keys.
+  custom_error_response {
+    error_code         = 403
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+  custom_error_response {
+    error_code         = 404
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+}
+
+resource "aws_s3_bucket_policy" "dashboard" {
+  bucket = aws_s3_bucket.dashboard.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "cloudfront.amazonaws.com" }
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.dashboard.arn}/*"
+        Condition = {
+          StringEquals = {
+            "AWS:SourceArn" = aws_cloudfront_distribution.dashboard.arn
+          }
+        }
+      }
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Cost guardrail
+# ---------------------------------------------------------------------------
+
+resource "aws_budgets_budget" "monthly" {
+  name         = "alpharank-monthly"
+  budget_type  = "COST"
+  limit_amount = "1.0"
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  dynamic "notification" {
+    for_each = var.budget_alert_email == "" ? [] : [1]
+    content {
+      comparison_operator        = "GREATER_THAN"
+      threshold                  = 80
+      threshold_type             = "PERCENTAGE"
+      notification_type          = "FORECASTED"
+      subscriber_email_addresses = [var.budget_alert_email]
+    }
+  }
+}
+
+output "api_base_url" {
+  description = "Base URL for the AlphaRank read API (set as VITE_API_BASE_URL)."
+  value       = aws_apigatewayv2_api.http.api_endpoint
+}
+
+output "dashboard_url" {
+  description = "Public AlphaRank dashboard URL."
+  value       = "https://${aws_cloudfront_distribution.dashboard.domain_name}"
+}
+
+output "dashboard_bucket" {
+  description = "S3 bucket hosting the dashboard build."
+  value       = aws_s3_bucket.dashboard.bucket
 }
