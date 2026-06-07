@@ -1,96 +1,112 @@
 import json
 import boto3
 import os
-import numpy as np
+import urllib.parse
 import pandas as pd
 from datetime import datetime
+from decimal import Decimal
 
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(os.environ["DDB_TABLE"])
+factor_snapshots_table = dynamodb.Table(os.environ["FACTOR_SNAPSHOTS_TABLE"])
 
 def processing_handler(event, context):
 
     try:
 
-    results = []
+        results = []
 
-    # Process each record in the event
-    for record in event["Records"]:
+        for record in event["Records"]:
 
-        # Parse SQS message
-        msg = json.loads(record["body"])
+            body = json.loads(record["body"])
 
-        # Get S3 bucket, key, and ticker
-        bucket = msg["bucket"]
-        key = msg["key"]
+            for s3_event in body["Records"]:
+                bucket = s3_event["s3"]["bucket"]["name"]
+                key = urllib.parse.unquote_plus(s3_event["s3"]["object"]["key"])
 
-        ticker = key.split("/")[1].upper()
+                ticker = key.split("/")[1].upper()
 
-        # Get data from S3
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        data = json.loads(obj["Body"].read())
+                print(f"Processing key={key}, ticker={ticker}")
 
-        # Convert data to DataFrame
-        if "Time Series (Daily)" not in data:
-            raise ValueError(f"Invalid API response: {data.keys()}")
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                data = json.loads(obj["Body"].read())
 
-        df = pd.DataFrame(data["Time Series (Daily)"]).T
-        df = df.astype(float)
+                if "Time Series (Daily)" not in data:
+                    raise ValueError(f"Invalid API response: {data.keys()}")
 
-        if len(df) < 50:
-            raise ValueError(f"Not enough data: {len(df)} rows. Need at least 50 rows.")
+                df = pd.DataFrame(data["Time Series (Daily)"]).T
+                df = df.astype(float)
 
-        cleaned_df = clean_data(df)
+                if len(df) < 50:
+                    raise ValueError(f"Not enough data: {len(df)} rows. Need at least 50 rows.")
 
-        # Compute score and signal
-        score = compute_score(cleaned_df)
-        signal = generate_signal(score)
+                cleaned_df = clean_data(df)
 
-        # Write result to DynamoDB
-        write_result(table, ticker, score, signal)
+                factors = compute_factors(cleaned_df)
+                batch_id = extract_batch_id(key)
+                write_factor_snapshot(factor_snapshots_table, batch_id, ticker, factors, key)
 
-        results.append({
-        "ticker": ticker,
-        "score": score,
-        "signal": signal
-    })
+                print(f"{ticker} factors={factors} written to FactorSnapshots (batch_id={batch_id})")
+
+                results.append({
+                    "ticker": ticker,
+                    "batch_id": batch_id,
+                    "factors": factors,
+                })
 
     except Exception as e:
         print(e)
         raise e
-    
+
     return {
-
         "statusCode": 200,
-        "body": json.dumps(results)
-
+        "body": json.dumps(results),
     }
 
-def compute_trend(df):
-    # Compute 20-day and 50-day simple moving averages
-    sma20 = df["4. close"].rolling(20).mean()
-    sma50 = df["4. close"].rolling(50).mean()
+def compute_factors(df) -> dict:
+    return {
+        "trend": compute_trend(df),
+        "momentum": compute_momentum(df),
+        "volatility": compute_volatility(df),
+        "zscore": compute_zscore(df),
+    }
 
-    # Compute trend as the difference between the two moving averages divided by the 50-day moving average
+def extract_batch_id(s3_key: str) -> str:
+    timestamp = s3_key.split("/")[2].replace(".json", "")
+    return timestamp.split("T")[0]
+
+def write_factor_snapshot(table, batch_id, ticker, factors, s3_key):
+    table.put_item(
+        Item={
+            "PK": batch_id,
+            "SK": ticker,
+            "trend": Decimal(str(factors["trend"])),
+            "momentum": Decimal(str(factors["momentum"])),
+            "volatility": Decimal(str(factors["volatility"])),
+            "zscore": Decimal(str(factors["zscore"])),
+            "s3_key": s3_key,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+    )
+
+def compute_trend(df):
+    sma20 = df["close"].rolling(20).mean()
+    sma50 = df["close"].rolling(50).mean()
+
     return (sma20.iloc[-1] - sma50.iloc[-1]) / sma50.iloc[-1]
 
 def compute_momentum(df):
-    # Compute momentum as the difference between the current close and the close 5 days ago
-    close = df["4. close"]
+    close = df["close"]
 
-    # Compute momentum as the difference between the current close and the close 5 days ago
     return (close.iloc[-1] / close.iloc[-5]) - 1
 
 def compute_volatility(df):
-    # Compute volatility as the standard deviation of the returns
-    returns = df["4. close"].pct_change()
+    returns = df["close"].pct_change()
 
     return returns.rolling(20).std().iloc[-1]
 
 def compute_zscore(df):
-    # Compute Z-score as the difference between the current close and the mean of the last 20 closes divided by the standard deviation of the last 20 closes
-    close = df["4. close"]
+    close = df["close"]
 
     mean = close.rolling(20).mean()
     std = close.rolling(20).std()
@@ -100,44 +116,7 @@ def compute_zscore(df):
 
     return (close.iloc[-1] - mean.iloc[-1]) / std.iloc[-1]
 
-def compute_score(df):
-    # Compute score as the weighted average of the trend, momentum, volatility, and Z-score
-    trend = compute_trend(df)
-    momentum = compute_momentum(df)
-    vol = compute_volatility(df)
-    z = compute_zscore(df)
-
-    score = (
-        0.4 * trend +
-        0.3 * momentum +
-        0.2 * (-z) +
-        0.1 * (1 / (vol + 1e-6))
-    )
-
-    return score
-
-def generate_signal(score):
-    # Generate signal as BUY, SELL, or HOLD based on the score
-    if score > 0.5:
-        return "BUY"
-    elif score < -0.5:
-        return "SELL"
-    else:
-        return "HOLD"
-
-def write_result(table, ticker, score, signal):
-    # Write result to DynamoDB
-    table.put_item(
-        Item={
-            "PK": ticker,
-            "SK": datetime.utcnow().isoformat(),
-            "score": str(score),
-            "signal": signal
-        }
-    )
-
 def clean_data(df):
-    # Clean data by renaming columns and ensuring required columns are present
     df.columns = [c.strip().lower().replace(" ", "") for c in df.columns]
 
     df = df.rename(columns={
